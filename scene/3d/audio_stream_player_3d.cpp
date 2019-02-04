@@ -32,6 +32,7 @@
 #include "core/engine.h"
 #include "scene/3d/area.h"
 #include "scene/3d/camera.h"
+#include "scene/3d/listener.h"
 #include "scene/main/viewport.h"
 
 void AudioStreamPlayer3D::_mix_audio() {
@@ -231,7 +232,246 @@ float AudioStreamPlayer3D::_get_attenuation_db(float p_distance) const {
 	return att;
 }
 
-void _update_sound() {
+bool AudioStreamPlayer3D::_add_listener_output(
+	Viewport *vp,
+	const Area *area,
+	const PhysicsDirectSpaceState *space_state,
+	Vector3& global_pos,
+	Vector3& linear_velocity,
+	const Spatial *listener,
+	int& index
+) {
+	Transform listener_transform = listener->get_global_transform();
+
+	Vector3 area_sound_pos;
+	Vector3 listener_area_pos;
+
+	if (area && area->is_using_reverb_bus() && area->get_reverb_uniformity() > 0) {
+		area_sound_pos = space_state->get_closest_point_to_object_volume(area->get_rid(), listener_transform.origin);
+		listener_area_pos = listener_transform.affine_inverse().xform(area_sound_pos);
+	}
+
+	if (max_distance > 0) {
+
+		float total_max = max_distance;
+
+		if (area && area->is_using_reverb_bus() && area->get_reverb_uniformity() > 0) {
+			total_max = MAX(total_max, listener_area_pos.length());
+		}
+		if (total_max > max_distance) {
+			return false; //can't hear this sound in this listener
+		}
+	}
+
+	Output output;
+	output.bus_index = AudioServer::get_singleton()->thread_find_bus_index(bus);
+	output.reverb_bus_index = -1; //no reverb by default
+	output.viewport = vp;
+
+	Vector3 local_pos = listener_transform.orthonormalized().affine_inverse().xform(global_pos);
+	float dist = local_pos.length();
+
+	float multiplier = Math::db2linear(_get_attenuation_db(dist));
+	if (max_distance > 0) {
+		multiplier *= MAX(0, 1.0 - (dist / max_distance));
+	}
+
+	float db_att = (1.0 - MIN(1.0, multiplier)) * attenuation_filter_db;
+
+	if (emission_angle_enabled) {
+		Vector3 camtopos = global_pos - listener_transform.origin;
+		float c = camtopos.normalized().dot(get_global_transform().basis.get_axis(2).normalized()); //it's z negative
+		float angle = Math::rad2deg(Math::acos(c));
+		if (angle > emission_angle)
+			db_att -= -emission_angle_filter_attenuation_db;
+	}
+
+	output.filter_gain = Math::db2linear(db_att);
+
+	Vector3 flat_pos = local_pos;
+	flat_pos.y = 0;
+	flat_pos.normalize();
+
+	unsigned int cc = AudioServer::get_singleton()->get_channel_count();
+	if (cc == 1) {
+		// Stereo pair
+		float c = flat_pos.x * 0.5 + 0.5;
+
+		output.vol[0].l = 1.0 - c;
+		output.vol[0].r = c;
+	} else {
+		Vector3 camtopos = global_pos - listener_transform.origin;
+		float c = camtopos.normalized().dot(get_global_transform().basis.get_axis(2).normalized()); //it's z negative
+		float angle = Math::rad2deg(Math::acos(c));
+		float av = angle * (flat_pos.x < 0 ? -1 : 1) / 180.0;
+
+		if (cc >= 1) {
+			// Stereo pair
+			float fl = Math::abs(1.0 - Math::abs(-0.8 - av));
+			float fr = Math::abs(1.0 - Math::abs(0.8 - av));
+
+			output.vol[0].l = fl;
+			output.vol[0].r = fr;
+		}
+
+		if (cc >= 2) {
+			// Center pair
+			float center = 1.0 - Math::sin(Math::acos(c));
+
+			output.vol[1].l = center;
+			output.vol[1].r = center;
+		}
+
+		if (cc >= 3) {
+			// Side pair
+			float sl = Math::abs(1.0 - Math::abs(-0.4 - av));
+			float sr = Math::abs(1.0 - Math::abs(0.4 - av));
+
+			output.vol[2].l = sl;
+			output.vol[2].r = sr;
+		}
+
+		if (cc >= 4) {
+			// Rear pair
+			float rl = Math::abs(1.0 - Math::abs(-0.2 - av));
+			float rr = Math::abs(1.0 - Math::abs(0.2 - av));
+
+			output.vol[3].l = rl;
+			output.vol[3].r = rr;
+		}
+	}
+
+	for (unsigned int k = 0; k < cc; k++) {
+		output.vol[k] *= multiplier;
+	}
+
+	bool filled_reverb = false;
+	int vol_index_max = AudioServer::get_singleton()->get_speaker_mode() + 1;
+
+	if (area) {
+
+		if (area->is_overriding_audio_bus()) {
+			//override audio bus
+			StringName bus_name = area->get_audio_bus();
+			output.bus_index = AudioServer::get_singleton()->thread_find_bus_index(bus_name);
+		}
+
+		if (area->is_using_reverb_bus()) {
+
+			filled_reverb = true;
+			StringName bus_name = area->get_reverb_bus();
+			output.reverb_bus_index = AudioServer::get_singleton()->thread_find_bus_index(bus_name);
+
+			float uniformity = area->get_reverb_uniformity();
+			float area_send = area->get_reverb_amount();
+
+			if (uniformity > 0.0) {
+
+				float distance = listener_area_pos.length();
+				float attenuation = Math::db2linear(_get_attenuation_db(distance));
+
+				//float dist_att_db = -20 * Math::log(dist + 0.00001); //logarithmic attenuation, like in real life
+
+				float center_val[3] = { 0.5f, 0.25f, 0.16666f };
+				AudioFrame center_frame(center_val[vol_index_max - 1], center_val[vol_index_max - 1]);
+
+				if (attenuation < 1.0) {
+					//pan the uniform sound
+					Vector3 rev_pos = listener_area_pos;
+					rev_pos.y = 0;
+					rev_pos.normalize();
+
+					if (cc >= 1) {
+						// Stereo pair
+						float c = rev_pos.x * 0.5 + 0.5;
+						output.reverb_vol[0].l = 1.0 - c;
+						output.reverb_vol[0].r = c;
+					}
+
+					if (cc >= 3) {
+						// Center pair + Side pair
+						float xl = Vector3(-1, 0, -1).normalized().dot(rev_pos) * 0.5 + 0.5;
+						float xr = Vector3(1, 0, -1).normalized().dot(rev_pos) * 0.5 + 0.5;
+
+						output.reverb_vol[1].l = xl;
+						output.reverb_vol[1].r = xr;
+						output.reverb_vol[2].l = 1.0 - xr;
+						output.reverb_vol[2].r = 1.0 - xl;
+					}
+
+					if (cc >= 4) {
+						// Rear pair
+						// FIXME: Not sure what math should be done here
+						float c = rev_pos.x * 0.5 + 0.5;
+						output.reverb_vol[3].l = 1.0 - c;
+						output.reverb_vol[3].r = c;
+					}
+
+					for (int i = 0; i < vol_index_max; i++) {
+
+						output.reverb_vol[i] = output.reverb_vol[i].linear_interpolate(center_frame, attenuation);
+					}
+				} else {
+					for (int i = 0; i < vol_index_max; i++) {
+
+						output.reverb_vol[i] = center_frame;
+					}
+				}
+
+				for (int i = 0; i < vol_index_max; i++) {
+
+					output.reverb_vol[i] = output.vol[i].linear_interpolate(output.reverb_vol[i] * attenuation, uniformity);
+					output.reverb_vol[i] *= area_send;
+				}
+
+			} else {
+
+				for (int i = 0; i < vol_index_max; i++) {
+
+					output.reverb_vol[i] = output.vol[i] * area_send;
+				}
+			}
+		}
+	}
+
+	if (doppler_tracking != DOPPLER_TRACKING_DISABLED) {
+
+		Vector3 listener_velocity;
+	
+		// TODO: allow doppler on Listener nodes
+		const Camera *camera = Object::cast_to<Camera>(listener);
+		if(camera) {
+			listener_velocity = camera->get_doppler_tracked_velocity();
+		}
+
+		Vector3 local_velocity = listener_transform.orthonormalized().basis.xform_inv(linear_velocity - listener_velocity);
+
+		if (local_velocity == Vector3()) {
+			output.pitch_scale = 1.0;
+		} else {
+			float approaching = local_pos.normalized().dot(local_velocity.normalized());
+			float velocity = local_velocity.length();
+			float speed_of_sound = 343.0;
+
+			output.pitch_scale = speed_of_sound / (speed_of_sound + velocity * approaching);
+			output.pitch_scale = CLAMP(output.pitch_scale, (1 / 8.0), 8.0); //avoid crazy stuff
+		}
+
+	} else {
+		output.pitch_scale = 1.0;
+	}
+
+	if (!filled_reverb) {
+
+		for (int i = 0; i < vol_index_max; i++) {
+
+			output.reverb_vol[i] = AudioFrame(0, 0);
+		}
+	}
+
+	outputs[index] = output;
+	index++;
+	return true;
 }
 
 void AudioStreamPlayer3D::_notification(int p_what) {
@@ -288,8 +528,6 @@ void AudioStreamPlayer3D::_notification(int p_what) {
 
 			Vector3 global_pos = get_global_transform().origin;
 
-			int bus_index = AudioServer::get_singleton()->thread_find_bus_index(bus);
-
 			//check if any area is diverting sound into a bus
 
 			PhysicsDirectSpaceState *space_state = PhysicsServer::get_singleton()->space_get_direct_state(world->get_space());
@@ -314,6 +552,7 @@ void AudioStreamPlayer3D::_notification(int p_what) {
 				break;
 			}
 
+			// if we didn't find any listener nodes, use cameras instead
 			List<Camera *> cameras;
 			world->get_camera_list(&cameras);
 
@@ -321,232 +560,35 @@ void AudioStreamPlayer3D::_notification(int p_what) {
 
 				Camera *camera = E->get();
 				Viewport *vp = camera->get_viewport();
+
 				if (!vp->is_audio_listener())
 					continue;
 
-				Vector3 local_pos = camera->get_global_transform().orthonormalized().affine_inverse().xform(global_pos);
+				Listener *listener = vp->get_listener();
 
-				float dist = local_pos.length();
-
-				Vector3 area_sound_pos;
-				Vector3 cam_area_pos;
-
-				if (area && area->is_using_reverb_bus() && area->get_reverb_uniformity() > 0) {
-					area_sound_pos = space_state->get_closest_point_to_object_volume(area->get_rid(), camera->get_global_transform().origin);
-					cam_area_pos = camera->get_global_transform().affine_inverse().xform(area_sound_pos);
-				}
-
-				if (max_distance > 0) {
-
-					float total_max = max_distance;
-
-					if (area && area->is_using_reverb_bus() && area->get_reverb_uniformity() > 0) {
-						total_max = MAX(total_max, cam_area_pos.length());
-					}
-					if (total_max > max_distance) {
-						continue; //can't hear this sound in this camera
-					}
-				}
-
-				float multiplier = Math::db2linear(_get_attenuation_db(dist));
-				if (max_distance > 0) {
-					multiplier *= MAX(0, 1.0 - (dist / max_distance));
-				}
-
-				Output output;
-				output.bus_index = bus_index;
-				output.reverb_bus_index = -1; //no reverb by default
-				output.viewport = vp;
-
-				float db_att = (1.0 - MIN(1.0, multiplier)) * attenuation_filter_db;
-
-				if (emission_angle_enabled) {
-					Vector3 camtopos = global_pos - camera->get_global_transform().origin;
-					float c = camtopos.normalized().dot(get_global_transform().basis.get_axis(2).normalized()); //it's z negative
-					float angle = Math::rad2deg(Math::acos(c));
-					if (angle > emission_angle)
-						db_att -= -emission_angle_filter_attenuation_db;
-				}
-
-				output.filter_gain = Math::db2linear(db_att);
-
-				Vector3 flat_pos = local_pos;
-				flat_pos.y = 0;
-				flat_pos.normalize();
-
-				unsigned int cc = AudioServer::get_singleton()->get_channel_count();
-				if (cc == 1) {
-					// Stereo pair
-					float c = flat_pos.x * 0.5 + 0.5;
-
-					output.vol[0].l = 1.0 - c;
-					output.vol[0].r = c;
+				if(listener) {
+					_add_listener_output(
+						vp,
+						area,
+						space_state,
+						global_pos,
+						linear_velocity,
+						listener,
+						new_output_count
+					);
 				} else {
-					Vector3 camtopos = global_pos - camera->get_global_transform().origin;
-					float c = camtopos.normalized().dot(get_global_transform().basis.get_axis(2).normalized()); //it's z negative
-					float angle = Math::rad2deg(Math::acos(c));
-					float av = angle * (flat_pos.x < 0 ? -1 : 1) / 180.0;
-
-					if (cc >= 1) {
-						// Stereo pair
-						float fl = Math::abs(1.0 - Math::abs(-0.8 - av));
-						float fr = Math::abs(1.0 - Math::abs(0.8 - av));
-
-						output.vol[0].l = fl;
-						output.vol[0].r = fr;
-					}
-
-					if (cc >= 2) {
-						// Center pair
-						float center = 1.0 - Math::sin(Math::acos(c));
-
-						output.vol[1].l = center;
-						output.vol[1].r = center;
-					}
-
-					if (cc >= 3) {
-						// Side pair
-						float sl = Math::abs(1.0 - Math::abs(-0.4 - av));
-						float sr = Math::abs(1.0 - Math::abs(0.4 - av));
-
-						output.vol[2].l = sl;
-						output.vol[2].r = sr;
-					}
-
-					if (cc >= 4) {
-						// Rear pair
-						float rl = Math::abs(1.0 - Math::abs(-0.2 - av));
-						float rr = Math::abs(1.0 - Math::abs(0.2 - av));
-
-						output.vol[3].l = rl;
-						output.vol[3].r = rr;
-					}
+					// no listener detected - just use the camera
+					_add_listener_output(
+						vp,
+						area,
+						space_state,
+						global_pos,
+						linear_velocity,
+						camera,
+						new_output_count
+					);
 				}
 
-				for (unsigned int k = 0; k < cc; k++) {
-					output.vol[k] *= multiplier;
-				}
-
-				bool filled_reverb = false;
-				int vol_index_max = AudioServer::get_singleton()->get_speaker_mode() + 1;
-
-				if (area) {
-
-					if (area->is_overriding_audio_bus()) {
-						//override audio bus
-						StringName bus_name = area->get_audio_bus();
-						output.bus_index = AudioServer::get_singleton()->thread_find_bus_index(bus_name);
-					}
-
-					if (area->is_using_reverb_bus()) {
-
-						filled_reverb = true;
-						StringName bus_name = area->get_reverb_bus();
-						output.reverb_bus_index = AudioServer::get_singleton()->thread_find_bus_index(bus_name);
-
-						float uniformity = area->get_reverb_uniformity();
-						float area_send = area->get_reverb_amount();
-
-						if (uniformity > 0.0) {
-
-							float distance = cam_area_pos.length();
-							float attenuation = Math::db2linear(_get_attenuation_db(distance));
-
-							//float dist_att_db = -20 * Math::log(dist + 0.00001); //logarithmic attenuation, like in real life
-
-							float center_val[3] = { 0.5f, 0.25f, 0.16666f };
-							AudioFrame center_frame(center_val[vol_index_max - 1], center_val[vol_index_max - 1]);
-
-							if (attenuation < 1.0) {
-								//pan the uniform sound
-								Vector3 rev_pos = cam_area_pos;
-								rev_pos.y = 0;
-								rev_pos.normalize();
-
-								if (cc >= 1) {
-									// Stereo pair
-									float c = rev_pos.x * 0.5 + 0.5;
-									output.reverb_vol[0].l = 1.0 - c;
-									output.reverb_vol[0].r = c;
-								}
-
-								if (cc >= 3) {
-									// Center pair + Side pair
-									float xl = Vector3(-1, 0, -1).normalized().dot(rev_pos) * 0.5 + 0.5;
-									float xr = Vector3(1, 0, -1).normalized().dot(rev_pos) * 0.5 + 0.5;
-
-									output.reverb_vol[1].l = xl;
-									output.reverb_vol[1].r = xr;
-									output.reverb_vol[2].l = 1.0 - xr;
-									output.reverb_vol[2].r = 1.0 - xl;
-								}
-
-								if (cc >= 4) {
-									// Rear pair
-									// FIXME: Not sure what math should be done here
-									float c = rev_pos.x * 0.5 + 0.5;
-									output.reverb_vol[3].l = 1.0 - c;
-									output.reverb_vol[3].r = c;
-								}
-
-								for (int i = 0; i < vol_index_max; i++) {
-
-									output.reverb_vol[i] = output.reverb_vol[i].linear_interpolate(center_frame, attenuation);
-								}
-							} else {
-								for (int i = 0; i < vol_index_max; i++) {
-
-									output.reverb_vol[i] = center_frame;
-								}
-							}
-
-							for (int i = 0; i < vol_index_max; i++) {
-
-								output.reverb_vol[i] = output.vol[i].linear_interpolate(output.reverb_vol[i] * attenuation, uniformity);
-								output.reverb_vol[i] *= area_send;
-							}
-
-						} else {
-
-							for (int i = 0; i < vol_index_max; i++) {
-
-								output.reverb_vol[i] = output.vol[i] * area_send;
-							}
-						}
-					}
-				}
-
-				if (doppler_tracking != DOPPLER_TRACKING_DISABLED) {
-
-					Vector3 camera_velocity = camera->get_doppler_tracked_velocity();
-
-					Vector3 local_velocity = camera->get_global_transform().orthonormalized().basis.xform_inv(linear_velocity - camera_velocity);
-
-					if (local_velocity == Vector3()) {
-						output.pitch_scale = 1.0;
-					} else {
-						float approaching = local_pos.normalized().dot(local_velocity.normalized());
-						float velocity = local_velocity.length();
-						float speed_of_sound = 343.0;
-
-						output.pitch_scale = speed_of_sound / (speed_of_sound + velocity * approaching);
-						output.pitch_scale = CLAMP(output.pitch_scale, (1 / 8.0), 8.0); //avoid crazy stuff
-					}
-
-				} else {
-					output.pitch_scale = 1.0;
-				}
-
-				if (!filled_reverb) {
-
-					for (int i = 0; i < vol_index_max; i++) {
-
-						output.reverb_vol[i] = AudioFrame(0, 0);
-					}
-				}
-
-				outputs[new_output_count] = output;
-				new_output_count++;
 				if (new_output_count == MAX_OUTPUTS)
 					break;
 			}

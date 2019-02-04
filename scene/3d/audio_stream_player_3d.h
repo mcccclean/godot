@@ -37,6 +37,7 @@
 #include "servers/audio/audio_stream.h"
 #include "servers/audio_server.h"
 
+class Area;
 class Camera;
 class AudioStreamPlayer3D : public Spatial {
 
@@ -138,6 +139,16 @@ private:
 	OutOfRangeMode out_of_range_mode;
 
 	float _get_attenuation_db(float p_distance) const;
+
+	bool _add_listener_output(
+		Viewport *vp,
+		const Area *area,
+		const PhysicsDirectSpaceState *space_state,
+		Vector3& global_pos,
+		Vector3& linear_velocity,
+		const Spatial *listener,
+		int& index
+	);
 
 protected:
 	void _validate_property(PropertyInfo &property) const;
